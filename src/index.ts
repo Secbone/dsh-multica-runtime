@@ -31,17 +31,20 @@ import {
   type RuntimeModelFrame,
 } from './protocol.js'
 import { installMulticaTerminalEnvironment } from './environment.js'
+import { waitForQuiescence, type SubagentLifecycle } from './lifecycle.js'
 
 export const name = 'multica-dsh-runtime'
 export const inject = ['cmdlineArgs', 'agents', 'agentDefaultModel', 'sessions', 'llm']
 
-const PLUGIN_VERSION = '0.1.0-private.1'
+const PLUGIN_VERSION = '0.2.0-private.1'
 
 interface ActiveRun {
   command: ExecuteCommand
   agent?: Agent
   firstSeq: number
   cancelRequested: boolean
+  /** Aborted on cancel so a pending subagent wait cannot hold the result frame. */
+  cancel: AbortController
   lastText: string
   endReason?: TurnEndReason
   toolNames: Map<string, string>
@@ -193,10 +196,14 @@ function renderBlock(block: ContentBlock): string {
       return block.text
     case 'image':
       return `[image attachment ${block.attachment.attachmentId}]`
+    case 'file':
+      return `[file attachment ${block.attachment.name} (${block.attachment.attachmentId})]`
     case 'tool-call':
       return `[tool call ${block.name}: ${block.arguments}]`
-    case 'tool-result':
-      return block.content.map(renderBlock).join('')
+    case 'tool-addition':
+    case 'tool-removal':
+      // Developer-message bookkeeping about the tool set, never tool output.
+      return ''
     default:
       return JSON.stringify(block)
   }
@@ -250,16 +257,19 @@ function observeSessionEvent(active: ActiveRun, session: Agent['session'], event
     return
   }
   if (event.type === 'tool/result') {
-    const result = event.data.message.content[0]
-    const rendered = truncateUtf8(result.content.map(renderBlock).join(''))
+    // DSH 0.2 commits the tool result as a ToolMessage: the call id and error
+    // flag live on the message itself and `content` is the result payload.
+    const message = event.data.message
+    const callId = String(message.toolCallId)
+    const rendered = truncateUtf8(message.content.map(renderBlock).join(''))
     writeFrame({
       v: PROTOCOL_VERSION,
       type: 'tool_result',
       request_id: requestId,
-      call_id: String(result.toolCallId),
-      name: active.toolNames.get(String(result.toolCallId)) ?? 'unknown',
+      call_id: callId,
+      name: active.toolNames.get(callId) ?? 'unknown',
       output: rendered.value,
-      is_error: result.isError === true,
+      is_error: message.isError === true,
       ...rendered.truncated ? { truncated: true } : {},
     })
     return
@@ -267,11 +277,17 @@ function observeSessionEvent(active: ActiveRun, session: Agent['session'], event
   if (event.type === 'turn/end') active.endReason = event.data.reason
 }
 
-async function drainContinuableSubagents(ctx: Context, agent: Agent): Promise<void> {
-  const subagents = ctx.get('subagents') as {
-    drainContinuableDescendants?(parents: readonly Agent[]): Promise<void>
-  } | undefined
-  await subagents?.drainContinuableDescendants?.([agent])
+function subagentLifecycle(ctx: Context): SubagentLifecycle | undefined {
+  return ctx.get('subagents') as SubagentLifecycle | undefined
+}
+
+/** Settle any still-running descendants before the root handle is disposed. */
+async function drainDescendants(ctx: Context, agent: Agent): Promise<void> {
+  try {
+    await subagentLifecycle(ctx)?.drainDescendants([agent])
+  } catch (error: unknown) {
+    writeDiagnostic(`subagent drain failed: ${errorMessage(error)}`)
+  }
 }
 
 function resultFromReason(active: ActiveRun): Omit<Extract<OutboundFrame, { type: 'result' }>, 'v' | 'type' | 'request_id' | 'session_id'> {
@@ -373,9 +389,9 @@ async function execute(ctx: Context, active: ActiveRun): Promise<number> {
         content: [{ type: 'text', text: active.command.prompt }],
         source: { kind: 'user' },
       }))
-      await handle.agent.whenIdle()
+      await waitForQuiescence(subagentLifecycle(ctx), handle.agent, active.cancel.signal)
     }
-    await drainContinuableSubagents(ctx, handle.agent)
+    await drainDescendants(ctx, handle.agent)
     await sessions.flush(handle.agent.session)
     const sessionId = String(handle.agent.session.id)
     const result = resultFromReason(active)
@@ -394,6 +410,7 @@ async function execute(ctx: Context, active: ActiveRun): Promise<number> {
       try {
         handle.agent.cancel({ kind: 'user' })
         await handle.agent.whenIdle()
+        await drainDescendants(ctx, handle.agent)
         await sessions.flush(handle.agent.session)
         await handle.dispose()
       } catch (cleanupError: unknown) {
@@ -452,6 +469,7 @@ async function stdio(ctx: Context): Promise<number> {
           command,
           firstSeq: Number.MAX_SAFE_INTEGER,
           cancelRequested: false,
+          cancel: new AbortController(),
           lastText: '',
           toolNames: new Map(),
         }
@@ -465,6 +483,7 @@ async function stdio(ctx: Context): Promise<number> {
       const active = activeRef.current
       if (active === undefined || command.request_id !== active.command.request_id || activeRef.finished) return
       active.cancelRequested = true
+      active.cancel.abort()
       active.agent?.cancel({ kind: 'user' })
     } catch (error: unknown) {
       protocolError('INVALID_COMMAND', errorMessage(error))
@@ -475,6 +494,7 @@ async function stdio(ctx: Context): Promise<number> {
         rejectExecute = undefined
       } else if (active !== undefined) {
         active.cancelRequested = true
+        active.cancel.abort()
         active.agent?.cancel({ kind: 'user' })
       }
     }
