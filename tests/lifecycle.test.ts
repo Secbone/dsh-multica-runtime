@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
-import { waitForQuiescence, type QuiescentAgent, type SubagentLifecycle } from '../src/lifecycle.js'
+import {
+  settleCancelled,
+  waitForQuiescence,
+  type CancellableAgent,
+  type QuiescentAgent,
+  type SubagentLifecycle,
+} from '../src/lifecycle.js'
 
 /** A root agent whose session seq a test advances to simulate new rounds. */
 interface FakeAgent {
@@ -24,7 +30,7 @@ function lifecycle(waitForChildren: SubagentLifecycle['waitForChildren']): Subag
 describe('waitForQuiescence', () => {
   it('returns after one idle check when the profile mounts no subagents', async () => {
     const agent = fakeAgent()
-    await waitForQuiescence(undefined, view(agent), new AbortController().signal)
+    await expect(waitForQuiescence(undefined, view(agent), new AbortController().signal)).resolves.toBe('settled')
     expect(agent.whenIdle).toHaveBeenCalledTimes(1)
   })
 
@@ -71,6 +77,90 @@ describe('waitForQuiescence', () => {
     const done = waitForQuiescence(subagents, view(agent), cancel.signal)
     cancel.abort()
 
-    await expect(done).resolves.toBeUndefined()
+    await expect(done).resolves.toBe('cancelled')
+  })
+
+  it('does not join a round a late child wakes after cancellation', async () => {
+    const agent = fakeAgent()
+    const cancel = new AbortController()
+    let markEntered!: () => void
+    const entered = new Promise<void>((resolveEntered) => { markEntered = resolveEntered })
+    let settleChildren!: (value: boolean) => void
+    const childWait = new Promise<boolean>((resolveChildren) => { settleChildren = resolveChildren })
+    const subagents = lifecycle(vi.fn(() => {
+      markEntered()
+      return childWait
+    }))
+
+    const done = waitForQuiescence(subagents, view(agent), cancel.signal)
+    await entered
+    const idleCallsBeforeCancel = agent.whenIdle.mock.calls.length
+    // The late child wakes the parent: from here on whenIdle() would follow the new round.
+    agent.status = 'running'
+    agent.whenIdle.mockImplementation(() => new Promise<void>(() => {}))
+    cancel.abort()
+    settleChildren(true)
+
+    await expect(done).resolves.toBe('cancelled')
+    expect(agent.whenIdle).toHaveBeenCalledTimes(idleCallsBeforeCancel)
+  })
+})
+
+describe('settleCancelled', () => {
+  function cancellable(): FakeAgent & { cancel: ReturnType<typeof vi.fn> } {
+    return { ...fakeAgent(), cancel: vi.fn() }
+  }
+
+  it('drains descendants before the final cancel so no child can wake the root again', async () => {
+    const agent = cancellable()
+    const order: string[] = []
+    agent.cancel.mockImplementation(() => { order.push('cancel') })
+    agent.whenIdle.mockImplementation(() => {
+      order.push('idle')
+      return Promise.resolve()
+    })
+    const subagents: SubagentLifecycle = {
+      waitForChildren: vi.fn(() => Promise.resolve(false)),
+      drainDescendants: vi.fn(() => {
+        order.push('drain')
+        return Promise.resolve()
+      }),
+    }
+
+    await settleCancelled(subagents, agent as unknown as CancellableAgent, () => {})
+
+    expect(order).toEqual(['cancel', 'drain', 'cancel', 'idle'])
+  })
+
+  it('cancels again until a round that started during the drain is idle', async () => {
+    const agent = cancellable()
+    // A late child round is running when the drain finishes; one cancel stops it.
+    agent.status = 'running'
+    agent.whenIdle.mockImplementation(() => Promise.resolve())
+    let cancels = 0
+    agent.cancel.mockImplementation(() => {
+      cancels += 1
+      if (cancels === 3) agent.status = 'idle'
+    })
+
+    await settleCancelled(undefined, agent as unknown as CancellableAgent, () => {})
+
+    expect(cancels).toBe(3)
+    expect(agent.status).toBe('idle')
+  })
+
+  it('still converges the root when the drain fails', async () => {
+    const agent = cancellable()
+    const onDrainError = vi.fn()
+    const failure = new Error('drain failed')
+    const subagents: SubagentLifecycle = {
+      waitForChildren: vi.fn(() => Promise.resolve(false)),
+      drainDescendants: vi.fn(() => Promise.reject(failure)),
+    }
+
+    await settleCancelled(subagents, agent as unknown as CancellableAgent, onDrainError)
+
+    expect(onDrainError).toHaveBeenCalledWith(failure)
+    expect(agent.whenIdle).toHaveBeenCalled()
   })
 })

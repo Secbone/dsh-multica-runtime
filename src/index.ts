@@ -31,7 +31,7 @@ import {
   type RuntimeModelFrame,
 } from './protocol.js'
 import { installMulticaTerminalEnvironment } from './environment.js'
-import { waitForQuiescence, type SubagentLifecycle } from './lifecycle.js'
+import { settleCancelled as settleCancelledAgent, waitForQuiescence, type SubagentLifecycle } from './lifecycle.js'
 
 export const name = 'multica-dsh-runtime'
 export const inject = ['cmdlineArgs', 'agents', 'agentDefaultModel', 'sessions', 'llm']
@@ -281,6 +281,13 @@ function subagentLifecycle(ctx: Context): SubagentLifecycle | undefined {
   return ctx.get('subagents') as SubagentLifecycle | undefined
 }
 
+/** Stop descendants, then converge the cancelled root without joining child-woken rounds. */
+function settleCancelled(ctx: Context, agent: Agent): Promise<void> {
+  return settleCancelledAgent(subagentLifecycle(ctx), agent, (error) => {
+    writeDiagnostic(`subagent drain failed: ${errorMessage(error)}`)
+  })
+}
+
 /** Settle any still-running descendants before the root handle is disposed. */
 async function drainDescendants(ctx: Context, agent: Agent): Promise<void> {
   try {
@@ -384,14 +391,16 @@ async function execute(ctx: Context, active: ActiveRun): Promise<number> {
       session_id: String(handle.agent.session.id),
       resumed: created.resumed,
     })
+    let outcome: 'settled' | 'cancelled' = active.cancelRequested ? 'cancelled' : 'settled'
     if (!active.cancelRequested) {
       handle.agent.followup(createUserMessage({
         content: [{ type: 'text', text: active.command.prompt }],
         source: { kind: 'user' },
       }))
-      await waitForQuiescence(subagentLifecycle(ctx), handle.agent, active.cancel.signal)
+      outcome = await waitForQuiescence(subagentLifecycle(ctx), handle.agent, active.cancel.signal)
     }
-    await drainDescendants(ctx, handle.agent)
+    if (outcome === 'cancelled' || active.cancelRequested) await settleCancelled(ctx, handle.agent)
+    else await drainDescendants(ctx, handle.agent)
     await sessions.flush(handle.agent.session)
     const sessionId = String(handle.agent.session.id)
     const result = resultFromReason(active)
@@ -408,9 +417,7 @@ async function execute(ctx: Context, active: ActiveRun): Promise<number> {
   } catch (error: unknown) {
     if (handle !== undefined) {
       try {
-        handle.agent.cancel({ kind: 'user' })
-        await handle.agent.whenIdle()
-        await drainDescendants(ctx, handle.agent)
+        await settleCancelled(ctx, handle.agent)
         await sessions.flush(handle.agent.session)
         await handle.dispose()
       } catch (cleanupError: unknown) {
