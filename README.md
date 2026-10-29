@@ -35,6 +35,22 @@ Install the local bundle into a DSH profile after building it:
 dsh plugin --profile multica add /absolute/path/to/multica-dsh-runtime
 ```
 
+Or install it straight from git — `dsh plugin` forwards to pnpm, and the
+`prepare` script builds `dist/` during the install, so no local checkout is
+needed:
+
+```bash
+dsh plugin --profile multica add github:multica-ai/dsh-multica-runtime
+```
+
+Use the tarball instead of a git spec when the machine running the daemon has
+no network path to GitHub:
+
+```bash
+pnpm pack
+dsh plugin --profile multica add /absolute/path/dsh-multica-runtime-0.2.0-private.1.tgz
+```
+
 The plugin supports:
 
 ```bash
